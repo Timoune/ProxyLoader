@@ -47,6 +47,9 @@ core/
   app_target.py             # AppTarget dataclass (an app + its optional pinned proxy)
   launcher.py               # Launches an app subprocess with proxy env vars set
   firefox_profile.py        # Throwaway Firefox profile generation + stale-profile cleanup
+mcp_server/
+  controller.py             # Headless controller over ProxyManager + saved state (no MCP dependency)
+  server.py                 # MCP tool/resource definitions + CLI (`python -m mcp_server`)
 Mac/
   app.py                    # AppKit application bootstrap
   glass_window.py           # Main window UI controller
@@ -76,6 +79,46 @@ State is saved to `~/Library/Application Support/proxyloader/state.json` by defa
 ## License
 
 See [LICENSE](LICENSE) — personal/non-commercial use only; commercial use requires permission from the copyright holder.
+
+## MCP server (let an LLM drive it)
+
+ProxyLoader ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an LLM client (Claude Desktop, Claude Code, Cursor, etc.) can manage proxies for you. It runs headless, reuses `core/`, and reads/writes the same `state.json` as the app, so it works on Linux too (system-wide proxy toggling and `.app` bundles are macOS-only).
+
+```bash
+pip install -r requirements-mcp.txt
+python -m mcp_server                                   # stdio (default)
+python -m mcp_server --transport streamable-http --port 8765
+python -m mcp_server --state /path/to/state.json        # use a separate state file
+```
+
+Claude Desktop / Claude Code config:
+
+```json
+{
+  "mcpServers": {
+    "proxyloader": {
+      "command": "python",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/path/to/ProxyLoader"
+    }
+  }
+}
+```
+
+Or with Claude Code: `claude mcp add proxyloader -- python -m mcp_server` from the repo root.
+
+**Tools**
+
+| Area | Tools |
+| --- | --- |
+| Status | `get_status` |
+| Proxy list | `list_proxies`, `import_proxies`, `import_proxy_file`, `remove_proxies`, `clear_proxies`, `sort_proxies_by_latency` |
+| Routing | `set_active_proxy`, `set_proxy_chain`, `clear_proxy_chain` |
+| Server | `start_proxy_server`, `stop_proxy_server`, `set_system_proxy` |
+| Health | `check_proxy_health`, `configure_health_checks` |
+| Per-app | `list_apps`, `add_app`, `remove_app`, `pin_app_to_proxy`, `launch_apps`, `stop_app_proxies`, `cleanup_firefox_profiles` |
+
+Read-only resources: `proxyloader://status` and `proxyloader://proxies`. Proxy passwords are never returned to the LLM (only `has_password`).
 
 ## Open questions
 

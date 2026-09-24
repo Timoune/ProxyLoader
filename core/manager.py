@@ -334,6 +334,17 @@ class ProxyManager:
         self._ensure_loop()
         asyncio.run_coroutine_threadsafe(self._probe_once(), self._loop)
 
+    def probe_and_wait(self, timeout: float = DEFAULT_TIMEOUT * 3) -> None:
+        self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(self._probe_once(), self._loop)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise ProxyManagerError("timed out waiting for health checks to finish") from exc
+        finally:
+            self._stop_loop_if_idle()
+
     async def _health_loop(self) -> None:
         try:
             while True:

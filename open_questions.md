@@ -17,3 +17,13 @@ Only macOS has a UI (`Mac/` is built on PyObjC/AppKit). `main.py` exits immediat
 ## Health check probe target
 
 `core/health_check.py` probes proxies by handshaking a CONNECT to `example.com:443` through each one. This confirms the proxy accepts connections and completes a real handshake, but doesn't verify the proxy can actually reach the open internet from wherever it's hosted, or measure anything beyond a single TLS-port connect's latency.
+
+## MCP server
+
+- **Running alongside the GUI.** `python -m mcp_server` owns its own `ProxyManager`; it doesn't talk to a running ProxyLoader window. Both read/write the same `state.json`, and whichever saves last wins (the GUI saves on close and after most actions). They also can't both bind the same local SOCKS port. Should the GUI host the MCP server in-process instead (e.g. streamable-http on localhost) so the LLM and the window share live state? Until then, point the MCP server at a separate file with `--state` if you want to use both at once.
+- **Passwords.** Tool output hides passwords (`has_password` only), but `state.json` still stores them in plain text like it always has. Moving credentials to the macOS Keychain would be the real fix.
+- **System proxy.** `set_system_proxy` / `start_proxy_server(system_proxy=true)` triggers the macOS admin password prompt via `osascript`, so a human still has to approve it. On other platforms these tools return an error.
+- **No auth on HTTP transport.** `--transport streamable-http` binds to `127.0.0.1` by default with no authentication. Binding it to a public interface would let anyone on the network reconfigure your proxies.
+- **`ProxyManager.probe_and_wait`.** Added so `check_proxy_health` can return fresh results. If a background health probe is already in flight it returns immediately and the tool reports whatever results exist at that moment (often `checking`).
+- **App launches.** Launched apps are not killed on `stop_app_proxies` or MCP server exit, same as the GUI. Firefox throwaway profiles are deleted when the launched Firefox exits, as long as the MCP server is still running; otherwise use `cleanup_firefox_profiles`.
+- **Dependency.** `mcp` lives in `requirements-mcp.txt` (not `requirements.txt`) so the py2app bundle doesn't grow; it requires the 2.x SDK (`MCPServer`, formerly `FastMCP`).
