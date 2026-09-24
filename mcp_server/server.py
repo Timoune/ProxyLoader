@@ -1,13 +1,16 @@
 import argparse
 import atexit
 import json
+import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from .controller import ControllerError, ProxyLoaderController
+from core.controller import ControllerError, ProxyLoaderController
+
+from .http_host import HttpHostError, McpHttpHost, client_config, http_url
 
 INSTRUCTIONS = (
     "ProxyLoader routes traffic through upstream SOCKS5/SOCKS4/HTTP proxies via a local SOCKS5 "
@@ -24,19 +27,21 @@ def _dump(value: Any) -> str:
 def build_server(controller: ProxyLoaderController) -> MCPServer:
     mcp = MCPServer(name="proxyloader", instructions=INSTRUCTIONS)
 
-    def call(fn, *args, **kwargs) -> str:
+    def call(fn, *args, mutates: bool = True, direct: bool = False, **kwargs) -> str:
         try:
-            return _dump(fn(*args, **kwargs))
+            if direct:
+                return _dump(fn(*args, **kwargs))
+            return _dump(controller.invoke(fn, *args, mutates=mutates, **kwargs))
         except ControllerError as exc:
             raise ToolError(str(exc)) from exc
 
     @mcp.tool(description="Show server state: running or not, bind port, mode, active proxy or chain, health-check settings.")
     def get_status() -> str:
-        return call(controller.status)
+        return call(controller.status, mutates=False)
 
     @mcp.tool(description="List every configured upstream proxy with its index, active/chain position, and latest health result.")
     def list_proxies() -> str:
-        return call(controller.list_proxies)
+        return call(controller.list_proxies, mutates=False)
 
     @mcp.tool(description=(
         "Add proxies from pasted text, one per line. Accepts socks5://user:pass@host:port, "
@@ -76,7 +81,7 @@ def build_server(controller: ProxyLoaderController) -> MCPServer:
 
     @mcp.tool(description="Probe every proxy right now with a real handshake and return the updated list with latency and status.")
     def check_proxy_health(timeout_seconds: float = 20.0) -> str:
-        return call(controller.check_health, timeout_seconds)
+        return call(controller.check_health, timeout_seconds, direct=True)
 
     @mcp.tool(description="Turn periodic background health checks on or off, optionally changing the interval (seconds, minimum 5).")
     def configure_health_checks(enabled: bool, interval_seconds: Optional[float] = None) -> str:
@@ -100,7 +105,7 @@ def build_server(controller: ProxyLoaderController) -> MCPServer:
 
     @mcp.tool(description="List app targets that can be launched with their traffic routed through a proxy.")
     def list_apps() -> str:
-        return call(controller.list_apps)
+        return call(controller.list_apps, mutates=False)
 
     @mcp.tool(description=(
         "Register an app to launch through a proxy. path is a macOS .app bundle or an executable. "
@@ -131,11 +136,11 @@ def build_server(controller: ProxyLoaderController) -> MCPServer:
 
     @mcp.resource("proxyloader://status", description="Current ProxyLoader status.", mime_type="application/json")
     def status_resource() -> str:
-        return _dump(controller.status())
+        return _dump(controller.invoke(controller.status, mutates=False))
 
     @mcp.resource("proxyloader://proxies", description="Configured proxies with health.", mime_type="application/json")
     def proxies_resource() -> str:
-        return _dump(controller.list_proxies())
+        return _dump(controller.invoke(controller.list_proxies, mutates=False))
 
     return mcp
 
@@ -150,19 +155,48 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="stdio for local MCP clients, streamable-http to serve over HTTP",
     )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (streamable-http only)")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP bind port (streamable-http only)")
+    parser.add_argument("--port", type=int, default=None, help="HTTP bind port (streamable-http only)")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow binding HTTP to a non-loopback address (anyone with the token can control proxies)",
+    )
+    parser.add_argument("--rotate-token", action="store_true", help="generate a new HTTP bearer token and exit")
+    parser.add_argument("--print-config", action="store_true", help="print the HTTP client config (with token) and exit")
     args = parser.parse_args(argv)
 
     controller = ProxyLoaderController(state_path=args.state)
+    secrets = controller.secrets
+    port = args.port or controller.mcp_port
+
+    if args.rotate_token:
+        secrets.rotate_mcp_token()
+        print("New MCP bearer token generated. Reconnect clients with --print-config output.", file=sys.stderr)
+        return
+    if args.print_config:
+        print(json.dumps(client_config(http_url(args.host, port), secrets.mcp_token()), indent=2))
+        return
+
+    server = build_server(controller)
+    host = None
+    if args.transport == "streamable-http":
+        token = secrets.mcp_token()
+        try:
+            host = McpHttpHost(server, lambda: token, host=args.host, port=port, allow_remote=args.allow_remote)
+        except HttpHostError as exc:
+            parser.error(str(exc))
+
     atexit.register(controller.shutdown)
     if controller.health_auto_enabled:
         controller.manager.start_health_checks(controller.health_interval)
 
-    server = build_server(controller)
-    if args.transport == "stdio":
+    if host is None:
         server.run("stdio")
-    else:
-        server.run("streamable-http", host=args.host, port=args.port)
+        return
+
+    print(f"ProxyLoader MCP listening on {host.url}", file=sys.stderr)
+    print("Clients must send 'Authorization: Bearer <token>'. Run with --print-config to get it.", file=sys.stderr)
+    host.serve_forever()
 
 
 if __name__ == "__main__":

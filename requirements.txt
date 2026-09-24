@@ -1,2 +1,5 @@
 pyobjc-core>=10.0
 pyobjc-framework-Cocoa>=10.0
+mcp>=2.2,<3
+keyring>=25.0
+cryptography>=42.0

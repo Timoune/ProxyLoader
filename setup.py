@@ -11,7 +11,19 @@ OPTIONS = {
         "CFBundleIconFile": "icon.icns",
         "LSUIElement": False,
     },
-    "packages": ["core"],
+    "packages": [
+        "core",
+        "mcp_server",
+        "mcp",
+        "uvicorn",
+        "starlette",
+        "sse_starlette",
+        "anyio",
+        "pydantic",
+        "pydantic_core",
+        "keyring",
+        "cryptography",
+    ],
 }
 
 setup(

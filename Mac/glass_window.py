@@ -1,6 +1,7 @@
+import json
 import objc
-import shutil
 import threading
+from collections import deque
 from AppKit import (
     NSApp,
     NSAlert,
@@ -10,6 +11,8 @@ from AppKit import (
     NSFont,
     NSMakeRect,
     NSOpenPanel,
+    NSPasteboard,
+    NSPasteboardTypeString,
     NSSwitchButton,
     NSTableColumn,
     NSTableView,
@@ -29,9 +32,9 @@ from AppKit import (
     NSViewWidthSizable,
     NSViewHeightSizable,
 )
-from Foundation import NSObject, NSURL
+from Foundation import NSDefaultRunLoopMode, NSObject, NSURL
 
-from core import firefox_profile, launcher, persistence
+from core.controller import ControllerError, ProxyLoaderController
 from core.health_check import STATUS_CHECKING, STATUS_DOWN, STATUS_UP
 from core.proxy_entry import count_candidate_lines
 from core.manager import ProxyManagerError
@@ -40,6 +43,9 @@ from . import app_bundle, system_proxy
 WINDOW_WIDTH = 460
 WINDOW_HEIGHT = 800
 NSALERT_FIRST_BUTTON_RETURN = 1000
+NSALERT_SECOND_BUTTON_RETURN = 1001
+NSALERT_THIRD_BUTTON_RETURN = 1002
+MAIN_THREAD_TIMEOUT = 30.0
 
 
 class ProxyTableDataSource(NSObject):
@@ -80,12 +86,12 @@ class ProxyTableDataSource(NSObject):
 
 
 class AppTableDataSource(NSObject):
-    def initWithTargets_proxyEntries_(self, targets, proxy_entries):
+    def initWithTargets_manager_(self, targets, manager):
         self = objc.super(AppTableDataSource, self).init()
         if self is None:
             return None
         self.targets = targets
-        self.proxy_entries = proxy_entries
+        self.manager = manager
         return self
 
     def numberOfRowsInTableView_(self, table_view):
@@ -95,8 +101,9 @@ class AppTableDataSource(NSObject):
         if row >= len(self.targets):
             return ""
         target = self.targets[row]
-        if target.proxy_index is not None and 0 <= target.proxy_index < len(self.proxy_entries):
-            return f"{target.display_name}  →  {self.proxy_entries[target.proxy_index].label()}"
+        entries = self.manager.entries
+        if target.proxy_index is not None and 0 <= target.proxy_index < len(entries):
+            return f"{target.display_name}  →  {entries[target.proxy_index].label()}"
         return f"{target.display_name}  —  no proxy pinned (uses active)"
 
 
@@ -107,28 +114,15 @@ class GlassWindowController(NSObject):
             return None
 
         self.manager = manager
-        self.selected_mode_active = False
-        # (Popen, profile_dir) pairs for launched Firefox-family processes
-        # whose throwaway profile still needs deleting — see
-        # `_spawn_profile_watcher`/`_cleanup_finished_firefox_profiles`.
-        self._firefox_launches = []
-        self._firefox_launches_lock = threading.Lock()
-
-        # Loads entries/active_index/chain/bind_port straight into `manager`
-        # and hands back the pieces the manager doesn't own. Must happen
-        # before the data sources below are built, since AppTableDataSource
-        # captures a direct reference to `manager.entries` (which load_state
-        # replaces wholesale) and `self.app_targets`.
-        loaded = persistence.load_state(manager)
-        self.mode = loaded.mode
-        self.app_targets = loaded.app_targets
-        self.last_import_path = loaded.last_import_path
-        self.health_interval = loaded.health_interval
-        self.health_auto_enabled = loaded.health_auto_enabled
+        self.core = ProxyLoaderController(manager=manager)
+        self._main_thread_tasks = deque()
+        self._main_thread_tasks_lock = threading.Lock()
+        self.mcp_host = None
+        self._mcp_token = None
 
         self.data_source = ProxyTableDataSource.alloc().initWithManager_(manager)
-        self.apps_data_source = AppTableDataSource.alloc().initWithTargets_proxyEntries_(
-            self.app_targets, manager.entries
+        self.apps_data_source = AppTableDataSource.alloc().initWithTargets_manager_(
+            self.core.app_targets, manager
         )
         self._build_window()
         self._apply_mode_to_ui()
@@ -137,81 +131,67 @@ class GlassWindowController(NSObject):
         self._update_status_label()
         manager.set_status_callback(self._on_status_change_background_thread)
         manager.set_health_callback(self._on_health_change_background_thread)
-        if self.health_auto_enabled:
-            manager.start_health_checks(self.health_interval)
+        self.core.set_ui_hooks(self._run_on_main_thread, self._refresh_from_core)
+        if self.core.health_auto_enabled:
+            manager.start_health_checks(self.core.health_interval)
+        if self.core.mcp_enabled:
+            self._start_mcp_host(quiet=True)
         return self
 
     def _save_state(self):
-        try:
-            persistence.save_state(
-                self.manager,
-                self.app_targets,
-                self.mode,
-                self.last_import_path,
-                self.health_interval,
-                self.health_auto_enabled,
+        self.core.try_save()
+
+    def _run_on_main_thread(self, fn):
+        done = threading.Event()
+        box = {}
+
+        def task():
+            try:
+                box["value"] = fn()
+            except BaseException as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        with self._main_thread_tasks_lock:
+            self._main_thread_tasks.append(task)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_modes_(
+            "drainMainThreadTasks:", None, False, [NSDefaultRunLoopMode]
+        )
+        if not done.wait(MAIN_THREAD_TIMEOUT):
+            raise ControllerError(
+                "the ProxyLoader window is busy (a dialog is probably open); try again once it's closed"
             )
-        except OSError:
-            pass  # best-effort — a failed save shouldn't interrupt the UI
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def drainMainThreadTasks_(self, sender):
+        while True:
+            with self._main_thread_tasks_lock:
+                if not self._main_thread_tasks:
+                    return
+                task = self._main_thread_tasks.popleft()
+            task()
+
+    def _refresh_from_core(self):
+        self.table.reloadData()
+        self.apps_table.reloadData()
+        self.port_field.setStringValue_(str(self.manager.bind_port))
+        self.chain_field.setStringValue_(",".join(str(i) for i in self.manager.chain))
+        self.health_auto_checkbox.setState_(1 if self.core.health_auto_enabled else 0)
+        self.health_interval_field.setStringValue_(str(int(self.core.health_interval)))
+        self._apply_mode_to_ui()
+        self._update_status_label()
 
     def windowWillClose_(self, notification):
         self._save_state()
-        self._cleanup_finished_firefox_profiles()
-
-    def _spawn_profile_watcher(self, process, profile_dir):
-        """Deletes `profile_dir` the moment `process` actually exits — run in
-        a background thread since that can be long after (or, if the user
-        never quits the app, never before proxyloader itself exits) any
-        proxyloader UI action. Never deletes a profile a still-running
-        process might still have open files/locks in.
-        """
-        with self._firefox_launches_lock:
-            self._firefox_launches.append((process, profile_dir))
-
-        def _wait_then_clean():
-            process.wait()
-            shutil.rmtree(profile_dir, ignore_errors=True)
-            with self._firefox_launches_lock:
-                if (process, profile_dir) in self._firefox_launches:
-                    self._firefox_launches.remove((process, profile_dir))
-
-        threading.Thread(target=_wait_then_clean, daemon=True).start()
-
-    def _cleanup_finished_firefox_profiles(self):
-        """Best-effort immediate sweep for any tracked launch whose process
-        has *already* exited by now (its own watcher thread from
-        `_spawn_profile_watcher` will already be racing to do the same
-        rmtree, so this only saves time, not correctness — `shutil.rmtree`
-        with `ignore_errors=True` on an already-gone directory is a no-op
-        either way). Deliberately does NOT touch entries whose process is
-        still running: Stop only tears down the local pinned proxy server,
-        it never kills the app processes proxyloader launched, so a still-
-        running Firefox is very much still using that profile directory.
-        Returns the list of profile dirs actually removed here.
-        """
-        with self._firefox_launches_lock:
-            still_running = []
-            finished = []
-            for process, profile_dir in self._firefox_launches:
-                (finished if process.poll() is not None else still_running).append(
-                    (process, profile_dir)
-                )
-            self._firefox_launches = still_running
-        removed = []
-        for _process, profile_dir in finished:
-            shutil.rmtree(profile_dir, ignore_errors=True)
-            removed.append(profile_dir)
-        return removed
+        self.core.cleanup_finished_firefox_profiles()
 
     def cleanupProfilesClicked_(self, sender):
-        # Two passes: first whatever this running proxyloader process itself
-        # already knows has exited, then a filesystem-wide sweep for
-        # anything else matching the profile-dir naming pattern anywhere in
-        # the OS temp dir — profiles orphaned by a crash, a force-quit, or a
-        # previous proxyloader run, not just this session's own launches.
-        removed = list(self._cleanup_finished_firefox_profiles())
-        swept, skipped = firefox_profile.sweep_stale_profiles()
-        removed.extend(p for p in swept if p not in removed)
+        result = self.core.cleanup_firefox_profiles()
+        removed = result["removed"]
+        skipped = result["skipped_in_use"]
 
         if not removed and not skipped:
             message = "No leftover Firefox profile folders found — already clean."
@@ -264,6 +244,7 @@ class GlassWindowController(NSObject):
         self._add_apps_section()
         self._add_start_stop_button()
         self._add_cleanup_button()
+        self._add_mcp_button()
         self._add_status_label()
 
         self.window.center()
@@ -332,10 +313,10 @@ class GlassWindowController(NSObject):
         row = self.table.clickedRow()
         if row < 0:
             return
-        if self.mode == "selected":
+        if self.core.mode == "selected":
             app_row = self.apps_table.selectedRow()
-            if app_row >= 0 and app_row < len(self.app_targets):
-                self.app_targets[app_row].proxy_index = row
+            if app_row >= 0 and app_row < len(self.core.app_targets):
+                self.core.app_targets[app_row].proxy_index = row
                 self.apps_table.reloadData()
                 self._update_status_label()
                 self._save_state()
@@ -401,7 +382,7 @@ class GlassWindowController(NSObject):
 
         path = urls[0].path()
         result = self.manager.import_file(path, replace=(mode == "replace"))
-        self.last_import_path = path
+        self.core.last_import_path = path
         self.table.reloadData()
         self._update_status_label()
         self.manager.probe_now()
@@ -510,7 +491,7 @@ class GlassWindowController(NSObject):
         for row in rows:
             if not self.manager.remove_at(row):
                 continue
-            for target in self.app_targets:
+            for target in self.core.app_targets:
                 if target.proxy_index is None:
                     continue
                 if target.proxy_index == row:
@@ -534,7 +515,7 @@ class GlassWindowController(NSObject):
 
     def sortByLatencyClicked_(self, sender):
         mapping = self.manager.sort_by_latency()
-        for target in self.app_targets:
+        for target in self.core.app_targets:
             if target.proxy_index is not None:
                 target.proxy_index = mapping.get(target.proxy_index)
         self.table.reloadData()
@@ -571,7 +552,7 @@ class GlassWindowController(NSObject):
         checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(20, 396, 160, 24))
         checkbox.setButtonType_(NSSwitchButton)
         checkbox.setTitle_("Auto-check health")
-        checkbox.setState_(1 if self.health_auto_enabled else 0)
+        checkbox.setState_(1 if self.core.health_auto_enabled else 0)
         checkbox.setTarget_(self)
         checkbox.setAction_("autoHealthToggled:")
         self.glass.addSubview_(checkbox)
@@ -587,7 +568,7 @@ class GlassWindowController(NSObject):
         self.glass.addSubview_(every_label)
 
         self.health_interval_field = NSTextField.alloc().initWithFrame_(NSMakeRect(222, 396, 45, 24))
-        self.health_interval_field.setStringValue_(str(int(self.health_interval)))
+        self.health_interval_field.setStringValue_(str(int(self.core.health_interval)))
         self.health_interval_field.setDelegate_(self)
         self.glass.addSubview_(self.health_interval_field)
 
@@ -601,9 +582,9 @@ class GlassWindowController(NSObject):
         self.glass.addSubview_(seconds_label)
 
     def autoHealthToggled_(self, sender):
-        self.health_auto_enabled = bool(sender.state())
-        if self.health_auto_enabled:
-            self.manager.start_health_checks(self.health_interval)
+        self.core.health_auto_enabled = bool(sender.state())
+        if self.core.health_auto_enabled:
+            self.manager.start_health_checks(self.core.health_interval)
         else:
             self.manager.stop_health_checks()
         self._save_state()
@@ -634,15 +615,16 @@ class GlassWindowController(NSObject):
             return False
         if interval < 5:
             return False
-        self.health_interval = interval
+        self.core.health_interval = interval
         self.manager.set_health_interval(interval)
         return True
 
     def applicationWillTerminate_(self, notification):
         self._flush_port_field()
         self._flush_health_interval_field()
+        self._stop_mcp_host()
         self._save_state()
-        self._cleanup_finished_firefox_profiles()
+        self.core.cleanup_finished_firefox_profiles()
 
     def _add_mode_toggle(self):
         button = NSButton.alloc().initWithFrame_(NSMakeRect(20, 360, 220, 28))
@@ -656,15 +638,15 @@ class GlassWindowController(NSObject):
     def toggleMode_(self, sender):
         if self._is_running():
             return
-        self.mode = "selected" if self.mode == "all" else "all"
+        self.core.mode = "selected" if self.core.mode == "all" else "all"
         self._apply_mode_to_ui()
         self._update_status_label()
         self._save_state()
 
     def _apply_mode_to_ui(self):
-        label = "Selected apps" if self.mode == "selected" else "All processes"
+        label = "Selected apps" if self.core.mode == "selected" else "All processes"
         self.mode_button.setTitle_(f"Mode: {label}")
-        is_selected = self.mode == "selected"
+        is_selected = self.core.mode == "selected"
         self.apps_scroll.setHidden_(not is_selected)
         self.add_app_button.setHidden_(not is_selected)
         self.unpin_button.setHidden_(not is_selected)
@@ -794,15 +776,15 @@ class GlassWindowController(NSObject):
             for url in panel.URLs():
                 target = app_bundle.resolve_app_bundle(url.path())
                 if target:
-                    self.app_targets.append(target)
+                    self.core.app_targets.append(target)
             self.apps_table.reloadData()
             self._save_state()
 
     def unpinAppClicked_(self, sender):
         row = self.apps_table.selectedRow()
-        if row < 0 or row >= len(self.app_targets):
+        if row < 0 or row >= len(self.core.app_targets):
             return
-        target = self.app_targets[row]
+        target = self.core.app_targets[row]
         if target.proxy_index is None:
             return
         target.proxy_index = None
@@ -834,12 +816,107 @@ class GlassWindowController(NSObject):
         self.glass.addSubview_(button)
         self.cleanup_button = button
 
+    def _add_mcp_button(self):
+        button = NSButton.alloc().initWithFrame_(NSMakeRect(185, 70, 120, 32))
+        button.setTitle_("LLM access: Off")
+        button.setBezelStyle_(1)
+        button.setTarget_(self)
+        button.setAction_("mcpButtonClicked:")
+        button.setToolTip_("Let an LLM client (Claude, Cursor, …) manage proxies over MCP on localhost.")
+        self.glass.addSubview_(button)
+        self.mcp_button = button
+
+    def _update_mcp_button(self):
+        running = self.mcp_host is not None and self.mcp_host.running
+        self.mcp_button.setTitle_("LLM access: On" if running else "LLM access: Off")
+
+    def _start_mcp_host(self, quiet=False):
+        try:
+            from mcp_server.http_host import McpHttpHost
+            from mcp_server.server import build_server
+
+            self._mcp_token = self.core.secrets.mcp_token()
+            host = McpHttpHost(
+                build_server(self.core),
+                lambda: self._mcp_token,
+                host="127.0.0.1",
+                port=self.core.mcp_port,
+            )
+            host.start()
+        except Exception as exc:
+            self.mcp_host = None
+            self._update_mcp_button()
+            if not quiet:
+                self._show_alert("Couldn't turn on LLM access", str(exc))
+            return False
+        self.mcp_host = host
+        self._update_mcp_button()
+        return True
+
+    def _stop_mcp_host(self):
+        if self.mcp_host is not None:
+            self.mcp_host.stop()
+        self.mcp_host = None
+        self._update_mcp_button()
+
+    def _copy_mcp_config(self):
+        from mcp_server.http_host import client_config
+
+        config = json.dumps(client_config(self.mcp_host.url, self._mcp_token), indent=2)
+        pasteboard = NSPasteboard.generalPasteboard()
+        pasteboard.clearContents()
+        pasteboard.setString_forType_(config, NSPasteboardTypeString)
+
+    def mcpButtonClicked_(self, sender):
+        if self.mcp_host is None or not self.mcp_host.running:
+            if not self._start_mcp_host():
+                return
+            self.core.mcp_enabled = True
+            self._save_state()
+            self._copy_mcp_config()
+            self._show_alert(
+                "LLM access is on",
+                f"MCP server listening on {self.mcp_host.url} (this Mac only).\n\n"
+                f"A client config with the access token was copied to the clipboard. "
+                f"Paste it into your MCP client's settings. Anyone with the token can "
+                f"control your proxies, so treat it like a password.",
+            )
+            return
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("LLM access")
+        alert.setInformativeText_(f"MCP server running on {self.mcp_host.url}.")
+        alert.addButtonWithTitle_("Copy config")
+        alert.addButtonWithTitle_("Turn off")
+        alert.addButtonWithTitle_("New token")
+        alert.addButtonWithTitle_("Cancel")
+        choice = alert.runModal()
+        if choice == NSALERT_FIRST_BUTTON_RETURN:
+            self._copy_mcp_config()
+        elif choice == NSALERT_SECOND_BUTTON_RETURN:
+            self._stop_mcp_host()
+            self.core.mcp_enabled = False
+            self._save_state()
+        elif choice == NSALERT_THIRD_BUTTON_RETURN:
+            try:
+                self._mcp_token = self.core.secrets.rotate_mcp_token()
+            except Exception as exc:
+                self._show_alert("Couldn't make a new token", str(exc))
+                return
+            self._copy_mcp_config()
+            self._show_alert(
+                "New token",
+                "Old token revoked. The updated client config was copied to the clipboard.",
+            )
+
     def toggleServer_(self, sender):
-        if self.mode == "all":
+        if self.core.mode == "all":
             if self.manager.running:
                 self.manager.stop()
                 try:
-                    system_proxy.disable_system_socks_proxy()
+                    if self.core.system_proxy_enabled:
+                        system_proxy.disable_system_socks_proxy()
+                    self.core.system_proxy_enabled = False
                 except Exception as exc:
                     self._show_alert(
                         "Proxy stopped, but system proxy wasn't reverted",
@@ -861,6 +938,7 @@ class GlassWindowController(NSObject):
                 self._save_state()  # bind_port may have just changed
                 try:
                     system_proxy.enable_system_socks_proxy(self.manager.bind_host, port)
+                    self.core.system_proxy_enabled = True
                 except Exception as exc:
                     self._show_alert(
                         "Proxy running, but system proxy wasn't enabled",
@@ -870,13 +948,11 @@ class GlassWindowController(NSObject):
                         f"or use per-app mode.",
                     )
         else:
-            if self.selected_mode_active:
-                self.manager.stop_all_pinned_servers()
-                self.selected_mode_active = False
-                self._cleanup_finished_firefox_profiles()
+            if self.core.selected_mode_active:
+                self.core.stop_app_proxies()
             else:
-                failures = self._launch_selected_apps()
-                self.selected_mode_active = True
+                failures = self.core.launch_apps()["failures"]
+                self.core.selected_mode_active = True
                 if failures:
                     self._show_alert(
                         "Some apps didn't get a proxy",
@@ -891,41 +967,8 @@ class GlassWindowController(NSObject):
         alert.setInformativeText_(message)
         alert.runModal()
 
-    def _launch_selected_apps(self):
-        port_by_proxy_index = {}
-        failures = []
-
-        def port_for_index(index):
-            if index not in port_by_proxy_index:
-                entry = self.manager.entries[index]
-                port = self.manager.start_pinned_server(f"proxy-{index}", [entry])
-                if port is None and self.manager.last_error:
-                    failures.append(f"proxy {index}: {self.manager.last_error}")
-                port_by_proxy_index[index] = port
-            return port_by_proxy_index[index]
-
-        for target in self.app_targets:
-            index = target.proxy_index if target.proxy_index is not None else self.manager.active_index
-            if index is None:
-                continue
-            port = port_for_index(index)
-            if port is None:
-                continue
-            extra_args, profile_dir = app_bundle.known_extra_args(target, self.manager.bind_host, port)
-            try:
-                process = launcher.launch_app_target(target, self.manager.bind_host, port, extra_args)
-            except OSError as exc:
-                failures.append(f"{target.display_name}: {exc}")
-                if profile_dir:
-                    shutil.rmtree(profile_dir, ignore_errors=True)
-            else:
-                if profile_dir:
-                    self._spawn_profile_watcher(process, profile_dir)
-
-        return failures
-
     def _is_running(self):
-        return self.manager.running or self.selected_mode_active
+        return self.manager.running or self.core.selected_mode_active
 
     def _add_status_label(self):
         label = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 10, WINDOW_WIDTH - 40, 50))
@@ -950,11 +993,11 @@ class GlassWindowController(NSObject):
         is_running = self._is_running()
         state_text = "running" if is_running else "stopped"
 
-        if self.mode == "all":
+        if self.core.mode == "all":
             mode_text = f"all processes — forwarding via {active_text}"
         else:
-            pinned_count = sum(1 for t in self.app_targets if t.proxy_index is not None)
-            unpinned_count = len(self.app_targets) - pinned_count
+            pinned_count = sum(1 for t in self.core.app_targets if t.proxy_index is not None)
+            unpinned_count = len(self.core.app_targets) - pinned_count
             mode_text = f"{pinned_count} app(s) pinned, {unpinned_count} using active ({active_text})"
 
         self.status_label.setStringValue_(f"{state_text}\nmode: {mode_text}")
@@ -980,8 +1023,8 @@ class GlassWindowController(NSObject):
 
         app_row = self.apps_table.selectedRow()
         has_pinned_selection = (
-            0 <= app_row < len(self.app_targets)
-            and self.app_targets[app_row].proxy_index is not None
+            0 <= app_row < len(self.core.app_targets)
+            and self.core.app_targets[app_row].proxy_index is not None
         )
         self.unpin_button.setEnabled_(has_pinned_selection)
 

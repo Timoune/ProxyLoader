@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
@@ -8,9 +9,11 @@ from .app_target import AppTarget
 from .health_check import DEFAULT_INTERVAL
 from .manager import ProxyManager
 from .proxy_entry import ProxyEntry
+from .secrets_store import SecretStore, SecretStoreError, is_encrypted, store_for
 
 STATE_FILENAME = "state.json"
-STATE_VERSION = 1
+STATE_VERSION = 2
+DEFAULT_MCP_PORT = 8765
 
 
 def default_state_dir() -> Path:
@@ -31,16 +34,43 @@ def default_state_path() -> Path:
     return default_state_dir() / STATE_FILENAME
 
 
-def _entry_from_dict(data: dict) -> Optional[ProxyEntry]:
+def _store_for_path(path: Path) -> SecretStore:
+    return store_for(Path(path).parent)
+
+
+def _entry_to_dict(entry: ProxyEntry, store: SecretStore) -> dict:
+    data = asdict(entry)
+    password = data.pop("password", None)
+    data["password_enc"] = store.encrypt(password) if password else None
+    return data
+
+
+class _EntryLoadStats:
+    def __init__(self):
+        self.plaintext_found = False
+        self.undecryptable = 0
+
+
+def _entry_from_dict(data: dict, store: SecretStore, stats: _EntryLoadStats) -> Optional[ProxyEntry]:
     if not isinstance(data, dict):
         return None
+    password = None
+    encrypted = data.get("password_enc")
+    if isinstance(encrypted, str) and is_encrypted(encrypted):
+        try:
+            password = store.decrypt(encrypted)
+        except SecretStoreError:
+            stats.undecryptable += 1
+    elif isinstance(data.get("password"), str) and data.get("password"):
+        password = data["password"]
+        stats.plaintext_found = True
     try:
         entry = ProxyEntry(
             scheme=str(data["scheme"]),
             host=str(data["host"]),
             port=int(data["port"]),
             username=data.get("username"),
-            password=data.get("password"),
+            password=password,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -67,10 +97,13 @@ def build_state_dict(
     last_import_path: Optional[str],
     health_interval: float,
     health_auto_enabled: bool,
+    store: SecretStore,
+    mcp_enabled: bool = False,
+    mcp_port: int = DEFAULT_MCP_PORT,
 ) -> dict:
     return {
         "version": STATE_VERSION,
-        "entries": [asdict(entry) for entry in manager.entries],
+        "entries": [_entry_to_dict(entry, store) for entry in manager.entries],
         "last_import_path": last_import_path,
         "active_index": manager.active_index,
         "chain": list(manager.chain),
@@ -79,6 +112,8 @@ def build_state_dict(
         "app_targets": [asdict(target) for target in app_targets],
         "health_interval": health_interval,
         "health_auto_enabled": health_auto_enabled,
+        "mcp_enabled": mcp_enabled,
+        "mcp_port": mcp_port,
     }
 
 
@@ -90,16 +125,31 @@ def save_state(
     health_interval: float,
     health_auto_enabled: bool,
     path: Optional[Path] = None,
+    mcp_enabled: bool = False,
+    mcp_port: int = DEFAULT_MCP_PORT,
 ) -> None:
     path = Path(path) if path else default_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = build_state_dict(
-        manager, app_targets, mode, last_import_path, health_interval, health_auto_enabled
-    )
+    try:
+        data = build_state_dict(
+            manager,
+            app_targets,
+            mode,
+            last_import_path,
+            health_interval,
+            health_auto_enabled,
+            _store_for_path(path),
+            mcp_enabled,
+            mcp_port,
+        )
+    except SecretStoreError as exc:
+        raise OSError(f"couldn't encrypt proxy passwords: {exc}") from exc
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as handle:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
     os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
 
 
 class LoadedState:
@@ -110,12 +160,20 @@ class LoadedState:
         last_import_path: Optional[str],
         health_interval: float = DEFAULT_INTERVAL,
         health_auto_enabled: bool = True,
+        mcp_enabled: bool = False,
+        mcp_port: int = DEFAULT_MCP_PORT,
+        needs_resave: bool = False,
+        undecryptable_passwords: int = 0,
     ):
         self.app_targets = app_targets
         self.mode = mode
         self.last_import_path = last_import_path
         self.health_interval = health_interval
         self.health_auto_enabled = health_auto_enabled
+        self.mcp_enabled = mcp_enabled
+        self.mcp_port = mcp_port
+        self.needs_resave = needs_resave
+        self.undecryptable_passwords = undecryptable_passwords
 
 
 def load_state(manager: ProxyManager, path: Optional[Path] = None) -> LoadedState:
@@ -138,9 +196,11 @@ def load_state(manager: ProxyManager, path: Optional[Path] = None) -> LoadedStat
         return LoadedState([], "all", None)
 
     raw_entries = data.get("entries")
+    stats = _EntryLoadStats()
+    store = _store_for_path(path)
     entries = [
         entry
-        for entry in (_entry_from_dict(item) for item in (raw_entries or []))
+        for entry in (_entry_from_dict(item, store, stats) for item in (raw_entries or []))
         if entry is not None
     ]
     manager.entries = entries
@@ -194,6 +254,30 @@ def load_state(manager: ProxyManager, path: Optional[Path] = None) -> LoadedStat
     if not isinstance(health_auto_enabled, bool):
         health_auto_enabled = True
 
+    if stats.undecryptable:
+        backup = path.with_name(path.name + ".undecryptable-backup")
+        if not backup.exists():
+            try:
+                shutil.copy2(path, backup)
+            except OSError:
+                pass
+
+    mcp_enabled = data.get("mcp_enabled")
+    if not isinstance(mcp_enabled, bool):
+        mcp_enabled = False
+
+    mcp_port = data.get("mcp_port")
+    if not (isinstance(mcp_port, int) and 0 < mcp_port < 65536):
+        mcp_port = DEFAULT_MCP_PORT
+
     return LoadedState(
-        app_targets, mode, last_import_path, health_interval, health_auto_enabled
+        app_targets,
+        mode,
+        last_import_path,
+        health_interval,
+        health_auto_enabled,
+        mcp_enabled,
+        mcp_port,
+        needs_resave=stats.plaintext_found,
+        undecryptable_passwords=stats.undecryptable,
     )

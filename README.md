@@ -44,12 +44,14 @@ core/
   socks5.py / socks4.py / http_proxy.py   # Upstream proxy protocol handshakes
   health_check.py          # Async probes (real handshake) for proxy status/latency
   persistence.py            # Save/load state.json (entries, app targets, mode, settings)
+  secrets_store.py          # Keychain-backed encryption key + MCP token; encrypts proxy passwords
+  controller.py             # App-level operations shared by the window and the MCP server
   app_target.py             # AppTarget dataclass (an app + its optional pinned proxy)
   launcher.py               # Launches an app subprocess with proxy env vars set
   firefox_profile.py        # Throwaway Firefox profile generation + stale-profile cleanup
 mcp_server/
-  controller.py             # Headless controller over ProxyManager + saved state (no MCP dependency)
   server.py                 # MCP tool/resource definitions + CLI (`python -m mcp_server`)
+  http_host.py              # Authenticated HTTP transport, run in a background thread by the app
 Mac/
   app.py                    # AppKit application bootstrap
   glass_window.py           # Main window UI controller
@@ -74,40 +76,55 @@ Lines starting with `#` or `//` are treated as comments.
 
 ## State storage
 
-State is saved to `~/Library/Application Support/proxyloader/state.json` by default (overridable via `PROXYLOADER_STATE_DIR`). It includes the proxy list, active selection/chain, bind port, app targets, and health-check settings.
+State is saved to `~/Library/Application Support/proxyloader/state.json` by default (overridable via `PROXYLOADER_STATE_DIR`). It includes the proxy list, active selection/chain, bind port, app targets, health-check settings, and LLM-access settings. The file is only readable by your user.
+
+Proxy passwords are encrypted in `state.json` (`"password_enc": "enc:v1:..."`, Fernet/AES). The encryption key and the MCP access token live in the macOS Keychain (service `proxyloader`), or your OS keyring on Linux. If no keyring is available, they fall back to `secrets.json` next to the state file (mode `600`); set `PROXYLOADER_NO_KEYRING=1` to force that. State files from older versions with plain-text passwords are encrypted automatically the first time they're loaded.
 
 ## License
 
 See [LICENSE](LICENSE) — personal/non-commercial use only; commercial use requires permission from the copyright holder.
 
-## MCP server (let an LLM drive it)
+## LLM access (MCP server)
 
-ProxyLoader ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an LLM client (Claude Desktop, Claude Code, Cursor, etc.) can manage proxies for you. It runs headless, reuses `core/`, and reads/writes the same `state.json` as the app, so it works on Linux too (system-wide proxy toggling and `.app` bundles are macOS-only).
+ProxyLoader has a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, so an LLM client (Claude Desktop, Claude Code, Cursor, etc.) can manage your proxies.
 
-```bash
-pip install -r requirements-mcp.txt
-python -m mcp_server                                   # stdio (default)
-python -m mcp_server --transport streamable-http --port 8765
-python -m mcp_server --state /path/to/state.json        # use a separate state file
-```
+### From the app
 
-Claude Desktop / Claude Code config:
+Click **LLM access: Off** at the bottom of the window. ProxyLoader starts an MCP server at `http://127.0.0.1:8765/mcp` inside the app itself, so the LLM and the window share the same live state (changes the LLM makes show up in the window right away). A ready-to-paste client config, access token included, is copied to your clipboard:
 
 ```json
 {
   "mcpServers": {
     "proxyloader": {
-      "command": "python",
-      "args": ["-m", "mcp_server"],
-      "cwd": "/path/to/ProxyLoader"
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
 
-Or with Claude Code: `claude mcp add proxyloader -- python -m mcp_server` from the repo root.
+Click the button again to re-copy the config, turn access off, or generate a new token (revokes the old one). The setting is remembered between launches. With Claude Code you can also run `claude mcp add --transport http proxyloader http://127.0.0.1:8765/mcp --header "Authorization: Bearer <token>"`.
 
-**Tools**
+### Headless (no window, works on Linux)
+
+```bash
+python -m mcp_server                                     # stdio, for clients that spawn the server
+python -m mcp_server --transport streamable-http          # HTTP on 127.0.0.1:8765, token required
+python -m mcp_server --print-config                       # print the HTTP client config with token
+python -m mcp_server --rotate-token                       # revoke the old token, make a new one
+python -m mcp_server --state /path/to/state.json          # use a separate state file
+```
+
+Stdio client config: `{"mcpServers": {"proxyloader": {"command": "python", "args": ["-m", "mcp_server"], "cwd": "/path/to/ProxyLoader"}}}`. Don't run the headless server against the same state file while the app is open; use the app's built-in server instead.
+
+### HTTP security
+
+- Every request needs `Authorization: Bearer <token>`; anything else gets a 401.
+- It only listens on loopback. Binding elsewhere needs an explicit `--allow-remote` (headless only).
+- Host/Origin headers are checked against the bind address to block DNS-rebinding attacks from web pages.
+
+### Tools
 
 | Area | Tools |
 | --- | --- |

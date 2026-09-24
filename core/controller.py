@@ -2,12 +2,12 @@ import platform
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from core import firefox_profile, launcher, persistence
-from core.app_target import AppTarget
-from core.health_check import DEFAULT_INTERVAL
-from core.manager import ProxyManager, ProxyManagerError
+from . import firefox_profile, launcher, persistence
+from .app_target import AppTarget
+from .manager import ProxyManager, ProxyManagerError
+from .secrets_store import SecretStore, store_for
 
 MIN_HEALTH_INTERVAL = 5.0
 
@@ -28,9 +28,44 @@ class ProxyLoaderController:
         self.last_import_path: Optional[str] = loaded.last_import_path
         self.health_interval: float = loaded.health_interval
         self.health_auto_enabled: bool = loaded.health_auto_enabled
+        self.mcp_enabled: bool = loaded.mcp_enabled
+        self.mcp_port: int = loaded.mcp_port
+        self.undecryptable_passwords: int = loaded.undecryptable_passwords
         self.system_proxy_enabled = False
+        self.selected_mode_active = False
+
+        self._firefox_launches: List[tuple] = []
+        self._firefox_launches_lock = threading.Lock()
+        self._dispatch: Optional[Callable[[Callable[[], Any]], Any]] = None
+        self._on_change: Optional[Callable[[], None]] = None
 
         self.manager.set_health_interval(self.health_interval)
+        if loaded.needs_resave:
+            self.try_save()
+
+    @property
+    def secrets(self) -> SecretStore:
+        return store_for(self.state_path.parent)
+
+    def set_ui_hooks(
+        self,
+        dispatch: Optional[Callable[[Callable[[], Any]], Any]],
+        on_change: Optional[Callable[[], None]],
+    ) -> None:
+        self._dispatch = dispatch
+        self._on_change = on_change
+
+    def invoke(self, fn: Callable, *args, mutates: bool = True, **kwargs):
+        def _call():
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if mutates and self._on_change is not None:
+                    self._on_change()
+
+        if self._dispatch is None or threading.current_thread() is threading.main_thread():
+            return _call()
+        return self._dispatch(_call)
 
     def save(self) -> None:
         persistence.save_state(
@@ -41,7 +76,15 @@ class ProxyLoaderController:
             self.health_interval,
             self.health_auto_enabled,
             path=self.state_path,
+            mcp_enabled=self.mcp_enabled,
+            mcp_port=self.mcp_port,
         )
+
+    def try_save(self) -> None:
+        try:
+            self.save()
+        except OSError:
+            pass
 
     def _require_proxy_index(self, index: int) -> None:
         if not (0 <= index < len(self.manager.entries)):
@@ -107,6 +150,8 @@ class ProxyLoaderController:
                 "health_interval": self.health_interval,
                 "health_auto_enabled": self.health_auto_enabled,
                 "app_target_count": len(self.app_targets),
+                "app_proxies_running": self.selected_mode_active,
+                "undecryptable_passwords": self.undecryptable_passwords,
                 "last_error": self.manager.last_error,
                 "state_path": str(self.state_path),
                 "platform": platform.system(),
@@ -203,6 +248,8 @@ class ProxyLoaderController:
         with self._lock:
             if port is not None and not (0 < port < 65536):
                 raise ControllerError(f"port {port} is out of range")
+            if self.selected_mode_active:
+                raise ControllerError("per-app proxies are running; call stop_app_proxies first")
             if not self.manager.active_chain():
                 raise ControllerError("no active proxy; import proxies and pick one first")
             try:
@@ -250,7 +297,7 @@ class ProxyLoaderController:
             self.manager.probe_and_wait(timeout=timeout)
         except ProxyManagerError as exc:
             raise ControllerError(str(exc)) from exc
-        return self.list_proxies()
+        return self.invoke(self.list_proxies, mutates=False)
 
     def configure_health_checks(self, enabled: bool, interval: Optional[float] = None) -> Dict[str, Any]:
         with self._lock:
@@ -312,6 +359,8 @@ class ProxyLoaderController:
 
     def launch_apps(self, indices: Optional[List[int]] = None) -> Dict[str, Any]:
         with self._lock:
+            if self.manager.running:
+                raise ControllerError("the all-processes proxy server is running; call stop_proxy_server first")
             chosen = list(range(len(self.app_targets))) if indices is None else indices
             for index in chosen:
                 self._require_app_index(index)
@@ -348,12 +397,15 @@ class ProxyLoaderController:
 
             if launched:
                 self.mode = "selected"
+                self.selected_mode_active = True
                 self.save()
             return {"launched": launched, "failures": failures}
 
     def stop_app_proxies(self) -> Dict[str, Any]:
         with self._lock:
             self.manager.stop_all_pinned_servers()
+            self.selected_mode_active = False
+            self.cleanup_finished_firefox_profiles()
             return self.status()
 
     def _extra_args(self, target: AppTarget, port: int):
@@ -364,15 +416,38 @@ class ProxyLoaderController:
         return [], None
 
     def _watch_profile(self, process, profile_dir: str) -> None:
+        with self._firefox_launches_lock:
+            self._firefox_launches.append((process, profile_dir))
+
         def _wait_then_clean():
             process.wait()
             shutil.rmtree(profile_dir, ignore_errors=True)
+            with self._firefox_launches_lock:
+                if (process, profile_dir) in self._firefox_launches:
+                    self._firefox_launches.remove((process, profile_dir))
 
         threading.Thread(target=_wait_then_clean, daemon=True).start()
 
+    def cleanup_finished_firefox_profiles(self) -> List[str]:
+        with self._firefox_launches_lock:
+            still_running = []
+            finished = []
+            for process, profile_dir in self._firefox_launches:
+                (finished if process.poll() is not None else still_running).append(
+                    (process, profile_dir)
+                )
+            self._firefox_launches = still_running
+        removed = []
+        for _process, profile_dir in finished:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            removed.append(profile_dir)
+        return removed
+
     def cleanup_firefox_profiles(self) -> Dict[str, Any]:
-        removed, skipped = firefox_profile.sweep_stale_profiles()
-        return {"removed": list(removed), "skipped_in_use": list(skipped)}
+        removed = self.cleanup_finished_firefox_profiles()
+        swept, skipped = firefox_profile.sweep_stale_profiles()
+        removed.extend(path for path in swept if path not in removed)
+        return {"removed": removed, "skipped_in_use": list(skipped)}
 
     def shutdown(self) -> None:
         with self._lock:
@@ -384,7 +459,5 @@ class ProxyLoaderController:
                     self._set_system_proxy(False)
             except (ControllerError, ProxyManagerError):
                 pass
-            try:
-                self.save()
-            except OSError:
-                pass
+            self.cleanup_finished_firefox_profiles()
+            self.try_save()
